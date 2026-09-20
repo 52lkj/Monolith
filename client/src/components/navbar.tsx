@@ -8,10 +8,13 @@ import { AdminGate } from "@/components/admin-gate";
 import { SearchTrigger } from "@/components/search";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { fetchNavPages, type NavPage } from "@/lib/api";
+import { useSiteSettings } from "@/lib/site-settings";
 
 const fixedStart = [{ href: "/", label: "首页" }];
 const fixedEnd = [
   { href: "/archive", label: "归档" },
+  { href: "/friends", label: "友链" },
+  { href: "/guestbook", label: "留言" },
   { href: "/about", label: "关于" },
 ];
 
@@ -20,6 +23,7 @@ export function Navbar() {
   const [open, setOpen] = useState(false);
   const [gateOpen, setGateOpen] = useState(false);
   const [navPages, setNavPages] = useState<NavPage[]>([]);
+  const { settings } = useSiteSettings();
 
   useEffect(() => {
     fetchNavPages().then(setNavPages);
@@ -62,11 +66,19 @@ export function Navbar() {
             className="group flex items-center gap-[10px] select-none animate-slide-in-left"
             onDoubleClick={handleLogoDoubleClick}
           >
-            <div className="relative flex h-[32px] w-[20px] items-center justify-center">
-              <div className="absolute inset-0 rounded-[3px] bg-gradient-to-b from-foreground/90 to-foreground/44 transition-all duration-300 group-hover:from-foreground group-hover:to-foreground/62" />
+            <div className="relative flex h-[32px] w-[32px] shrink-0 items-center justify-center">
+              {settings.site_icon ? (
+                <img
+                  src={settings.site_icon}
+                  alt=""
+                  className="h-[28px] w-[28px] rounded-md object-cover transition-transform duration-300 group-hover:-translate-y-[2px]"
+                />
+              ) : (
+                <div className="absolute inset-0 rounded-[3px] bg-gradient-to-b from-foreground/90 to-foreground/44 transition-all duration-300 group-hover:from-foreground group-hover:to-foreground/62" />
+              )}
             </div>
-            <span className="text-[18px] font-semibold tracking-[-0.03em] text-foreground">
-              Monolith
+            <span className="max-w-[180px] truncate text-[18px] font-semibold tracking-[-0.03em] text-foreground sm:max-w-[240px]">
+              {settings.site_title}
             </span>
           </Link>
 

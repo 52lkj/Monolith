@@ -7,8 +7,9 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { sign, verify } from "hono/jwt";
+import type { Context } from "hono";
 import { createDatabase, createObjectStorage } from "./storage/factory";
-import type { CreatePostInput, IDatabase } from "./storage/interfaces";
+import type { CreateFriendLinkInput, CreatePostInput, FriendLink, IDatabase } from "./storage/interfaces";
 import type { IObjectStorage } from "./storage/interfaces";
 import { writeAnalyticsPoint, isWebsiteAllowed } from "./analytics/ae-tracker";
 import { queryAEAnalytics } from "./analytics/ae-query";
@@ -26,7 +27,10 @@ type Bindings = {
   AUTO_SCHEMA_MIGRATION?: string;
   STORAGE_PROVIDER?: string;
   WEBHOOK_URLS?: string; // 逗号分隔的 Webhook 目标地址
-  SITE_ORIGIN?: string; // 对外公开域名（如 https://monolith-client.pages.dev），用于 sitemap/robots
+  RESEND_API_KEY?: string;
+  RESEND_FROM?: string;
+  ADMIN_EMAIL?: string;
+  SITE_ORIGIN?: string; // 对外公开域名（如 https://monolith-client.pages.dev），用于 sitemap/robots/RSS
   CLOUDFLARE_ACCOUNT_ID?: string; // AE GraphQL 查询用
   CLOUDFLARE_API_TOKEN?: string; // AE GraphQL 查询用（需要 Account Analytics:Read 权限）
   ANALYTICS_WEBSITE_WHITELIST?: string; // 站点白名单，格式: domain1|domain2 (空=放行所有)
@@ -39,6 +43,7 @@ type Variables = {
 };
 
 const app = new Hono<{ Bindings: Bindings; Variables: Variables }>();
+type AppContext = Context<{ Bindings: Bindings; Variables: Variables }>;
 
 /* ── 全局中间件 ────────────────────────────── */
 app.use("*", cors({
@@ -105,6 +110,63 @@ async function triggerWebhook(c: any, eventName: string, payload: any) {
   }
 }
 
+function escapeEmailHtml(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+}
+
+function publicSiteOrigin(c: AppContext): string {
+  return c.env.SITE_ORIGIN || new URL(c.req.url).origin;
+}
+
+function sendEmail(c: AppContext, message: { to: string; subject: string; html: string }): void {
+  const { RESEND_API_KEY, RESEND_FROM } = c.env;
+  if (!RESEND_API_KEY || !RESEND_FROM || !message.to) return;
+
+  const request = fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${RESEND_API_KEY}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: RESEND_FROM, to: [message.to], subject: message.subject, html: message.html }),
+  })
+    .then((response) => {
+      if (!response.ok) {
+        console.error("Resend email notification failed", response.status, response.statusText);
+      }
+    })
+    .catch((error) => console.error("Resend email notification failed", error));
+
+  if (c.executionCtx?.waitUntil) c.executionCtx.waitUntil(request);
+}
+
+function notifyFriendSubmission(c: AppContext, link: FriendLink): void {
+  const adminEmail = c.env.ADMIN_EMAIL;
+  if (!adminEmail) return;
+  const origin = publicSiteOrigin(c);
+  sendEmail(c, {
+    to: adminEmail,
+    subject: `[Monolith] 新友链申请待审核: ${link.name}`,
+    html: `<p><strong>${escapeEmailHtml(link.name)}</strong> 提交了友链申请。</p>
+      <p>站点：<a href="${escapeEmailHtml(link.url)}">${escapeEmailHtml(link.url)}</a></p>
+      <p>简介：${escapeEmailHtml(link.description || "无")}</p>
+      <p>联系人：${escapeEmailHtml(link.ownerName || "无")}；邮箱：${escapeEmailHtml(link.ownerEmail || "未填写")}</p>
+      <p><a href="${origin}/admin/friends">前往后台审核</a></p>`,
+  });
+}
+
+function notifyFriendReview(c: AppContext, link: FriendLink, approved: boolean): void {
+  if (!link.ownerEmail) return;
+  const origin = publicSiteOrigin(c);
+  const status = approved ? "已通过" : "未通过";
+  const detail = approved
+    ? `<p>你的站点现已展示在 <a href="${origin}/friends">友链页面</a>。</p>`
+    : "<p>感谢你的申请；本次暂未能收录，敬请谅解。</p>";
+  sendEmail(c, {
+    to: link.ownerEmail,
+    subject: `[Monolith] 友链申请${status}: ${link.name}`,
+    html: `<p>你好，${escapeEmailHtml(link.ownerName || link.name)}：</p>
+      <p>你提交的站点 <a href="${escapeEmailHtml(link.url)}">${escapeEmailHtml(link.name)}</a> 友链申请${status}。</p>${detail}`,
+  });
+}
+
 type BackupPreviewPayload = {
   version?: string;
   exportedAt?: string;
@@ -118,6 +180,137 @@ type BackupPreviewOptions = {
   includeSettings?: boolean;
   source?: string;
 };
+
+async function readJson<T>(c: AppContext): Promise<{ ok: true; body: T } | { ok: false; response: Response }> {
+  try {
+    const body = await c.req.json();
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { ok: false, response: c.json({ error: "请求体必须是 JSON 对象" }, 400) };
+    }
+    return { ok: true, body: body as T };
+  } catch {
+    return { ok: false, response: c.json({ error: "请求体必须是有效 JSON" }, 400) };
+  }
+}
+
+function normalizeText(value: unknown, maxLength: number): string {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : "";
+}
+
+function normalizeOptionalEmail(value: unknown): string {
+  const email = normalizeText(value, 160);
+  if (!email) return "";
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? email : "";
+}
+
+const DEFAULT_SITE_TIMEZONE = "Asia/Shanghai";
+
+function normalizeSiteTimezone(value: unknown): string {
+  if (typeof value !== "string") return DEFAULT_SITE_TIMEZONE;
+  const timezone = value.trim();
+  if (!timezone) return DEFAULT_SITE_TIMEZONE;
+
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: timezone }).format();
+    return timezone;
+  } catch {
+    return DEFAULT_SITE_TIMEZONE;
+  }
+}
+
+function normalizeSettings(settings: unknown): Record<string, string> | undefined {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) return undefined;
+  const normalized = { ...(settings as Record<string, string>) };
+  if (Object.prototype.hasOwnProperty.call(normalized, "site_timezone")) {
+    normalized.site_timezone = normalizeSiteTimezone(normalized.site_timezone);
+  }
+  return normalized;
+}
+
+function normalizePublicUrl(value: unknown): string {
+  const raw = normalizeText(value, 500);
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return "";
+    parsed.username = "";
+    parsed.password = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return "";
+  }
+}
+
+function isUniqueConstraintError(error: unknown): boolean {
+  const details = error && typeof error === "object"
+    ? error as { code?: unknown; message?: unknown; cause?: unknown }
+    : {};
+  const code = String(details.code || "");
+  const message = String(details.message || error || "").toLowerCase();
+  return code === "23505"
+    || code === "SQLITE_CONSTRAINT_UNIQUE"
+    || code === "SQLITE_CONSTRAINT"
+    || message.includes("unique constraint")
+    || message.includes("duplicate key")
+    || message.includes("already exists")
+    || (details.cause !== error && isUniqueConstraintError(details.cause));
+}
+
+function parseSocialLinksSetting(value: string): CreateFriendLinkInput[] {
+  if (!value.trim()) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    const links: CreateFriendLinkInput[] = [];
+    parsed.forEach((item, index) => {
+      if (!item || typeof item !== "object") return;
+      const record = item as Record<string, unknown>;
+      const url = normalizePublicUrl(record.url);
+      const name = normalizeText(record.label, 80) || normalizeText(record.title, 80);
+      const enabled = record.enabled !== false;
+      if (!enabled || !url || !name) return;
+      links.push({
+        name,
+        url,
+        description: normalizeText(record.description, 240),
+        status: "approved",
+        source: "imported",
+        sortOrder: index,
+      });
+    });
+    return links;
+  } catch {
+    return [];
+  }
+}
+
+function publicFriendLink(link: FriendLink) {
+  return {
+    id: link.id,
+    name: link.name,
+    url: link.url,
+    description: link.description,
+    avatarUrl: link.avatarUrl,
+    sortOrder: link.sortOrder,
+  };
+}
+
+function publicGuestbookMessage(message: {
+  id: number;
+  authorName: string;
+  content: string;
+  approved: boolean;
+  createdAt: string;
+}) {
+  return {
+    id: message.id,
+    authorName: message.authorName,
+    content: message.content,
+    approved: message.approved,
+    createdAt: message.createdAt,
+  };
+}
 
 async function readObjectBody(body: ReadableStream<Uint8Array>): Promise<string> {
   const reader = body.getReader();
@@ -206,19 +399,71 @@ async function buildBackupPreview(
   };
 }
 
+function normalizeHostname(hostname: string): string {
+  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+}
+
+function isBlockedIpv4(hostname: string): boolean {
+  const parts = hostname.split(".");
+  if (parts.length !== 4) return false;
+  const bytes = parts.map((part) => Number(part));
+  if (bytes.some((byte, index) => !/^\d+$/.test(parts[index]) || !Number.isInteger(byte) || byte < 0 || byte > 255)) {
+    return false;
+  }
+  const [a, b] = bytes;
+  return a === 0
+    || a === 10
+    || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && (b === 0 || b === 168))
+    || (a === 198 && (b === 18 || b === 19))
+    || a >= 224;
+}
+
+function isBlockedIpv6(hostname: string): boolean {
+  if (!hostname.includes(":")) return false;
+  const host = hostname.toLowerCase();
+  if (host === "::" || host === "::1" || host === "0:0:0:0:0:0:0:1") return true;
+  if (host.startsWith("fc") || host.startsWith("fd") || /^fe[89ab]/.test(host) || host.startsWith("ff")) return true;
+  if (host.startsWith("::ffff:")) return isBlockedIpv4(host.slice("::ffff:".length));
+  return false;
+}
+
+function isBlockedWebdavHostname(hostname: string): boolean {
+  const host = normalizeHostname(hostname);
+  if (!host || host === "localhost" || host.endsWith(".localhost")) return true;
+  return isBlockedIpv4(host) || isBlockedIpv6(host);
+}
+
 function validateWebdavTarget(url: string): { ok: true; baseUrl: string } | { ok: false; error: string } {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") {
       return { ok: false, error: "仅允许 HTTPS 协议的 WebDAV 地址" };
     }
-    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.|169\.254\.|::1|fc)/.test(parsed.hostname)) {
+    if (parsed.username || parsed.password) {
+      return { ok: false, error: "WebDAV 地址不允许包含用户名或密码" };
+    }
+    if (parsed.search || parsed.hash) {
+      return { ok: false, error: "WebDAV 地址不允许包含查询参数或锚点" };
+    }
+    if (isBlockedWebdavHostname(parsed.hostname)) {
       return { ok: false, error: "不允许内网地址" };
     }
-    return { ok: true, baseUrl: url.replace(/\/$/, "") };
+    return { ok: true, baseUrl: `${parsed.origin}${parsed.pathname.replace(/\/$/, "")}` };
   } catch {
     return { ok: false, error: "无效的 WebDAV 地址" };
   }
+}
+
+async function fetchWebdav(url: string, init: RequestInit): Promise<Response> {
+  const res = await fetch(url, { ...init, redirect: "manual" });
+  if (res.status >= 300 && res.status < 400) {
+    throw new Error("WebDAV 目标返回重定向，已拒绝");
+  }
+  return res;
 }
 
 /* ── 健康检查端点 ──────────────────────────── */
@@ -387,12 +632,14 @@ app.get("/api/posts/:slug/comments", async (c) => {
 // 提交评论（公开接口，需审核后才显示）
 app.post("/api/posts/:slug/comments", async (c) => {
   const slug = c.req.param("slug");
-  const body = await c.req.json<{
+  const parsed = await readJson<{
     authorName: string;
     authorEmail?: string;
     content: string;
     _hp?: string; // honeypot 反垃圾字段
-  }>();
+  }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   // Honeypot 反垃圾：如果隐藏字段被填写，静默拒绝
   if (body._hp) return c.json({ success: true, message: "评论已提交，等待审核" });
@@ -446,6 +693,60 @@ app.post("/api/posts/:slug/comments", async (c) => {
   }
 });
 
+// 获取留言板留言（仅已审核，不暴露邮箱）
+app.get("/api/guestbook", async (c) => {
+  const beforeId = Number.parseInt(c.req.query("before") || "", 10);
+  const pageSize = 20;
+  const messages = await c.get("db").getApprovedGuestbookMessages(
+    pageSize + 1,
+    Number.isInteger(beforeId) && beforeId > 0 ? beforeId : undefined,
+  );
+  const hasMore = messages.length > pageSize;
+  const items = messages.slice(0, pageSize).map(publicGuestbookMessage);
+  return c.json({
+    items,
+    nextCursor: hasMore ? items.at(-1)?.id ?? null : null,
+  });
+});
+
+// 提交留言板留言（公开接口，需审核后才显示）
+app.post("/api/guestbook", async (c) => {
+  const ip = getClientIp(c);
+  if (isGuestbookRateLimited(ip, Date.now())) {
+    return c.json({ error: "提交过于频繁，请稍后再试" }, 429);
+  }
+
+  const parsed = await readJson<{
+    authorName: string;
+    authorEmail?: string;
+    content: string;
+    _hp?: string;
+  }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+
+  if (body._hp) return c.json({ success: true, message: "留言已提交，等待审核" });
+
+  const authorName = normalizeText(body.authorName, 50);
+  const authorEmail = normalizeOptionalEmail(body.authorEmail);
+  const content = normalizeText(body.content, 2000);
+
+  if (!authorName || !content) {
+    return c.json({ error: "昵称和留言内容不能为空" }, 400);
+  }
+  if (body.authorEmail && !authorEmail) {
+    return c.json({ error: "邮箱格式无效" }, 400);
+  }
+
+  const message = await c.get("db").addGuestbookMessage({
+    authorName,
+    authorEmail,
+    content,
+  });
+  await triggerWebhook(c, "guestbook_message_submitted", { id: message.id, authorName });
+  return c.json({ success: true, message: "留言已提交，等待审核" }, 201);
+});
+
 // 获取文章表情反应统计
 app.get("/api/posts/:slug/reactions", async (c) => {
   const slug = c.req.param("slug");
@@ -457,7 +758,9 @@ app.get("/api/posts/:slug/reactions", async (c) => {
 // 切换表情反应（无需登录，IP 去重）
 app.post("/api/posts/:slug/reactions", async (c) => {
   const slug = c.req.param("slug");
-  const body = await c.req.json<{ type: string }>();
+  const parsed = await readJson<{ type: string }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   const validTypes = ["like", "heart", "celebrate", "think"];
   if (!validTypes.includes(body.type)) {
@@ -492,6 +795,7 @@ app.get("/api/settings/public", async (c) => {
     hero_description: all.hero_description || "",
     hero_actions: all.hero_actions || "",
     hero_topics: all.hero_topics || "",
+    site_icon: all.site_icon || "",
     site_og_image: all.site_og_image || "",
     footer_text: all.footer_text || "",
     author_name: all.author_name || "Monolith",
@@ -505,7 +809,76 @@ app.get("/api/settings/public", async (c) => {
     rss_enabled: all.rss_enabled || "true",
     custom_header: all.custom_header || "",
     custom_footer: all.custom_footer || "",
+    site_timezone: normalizeSiteTimezone(all.site_timezone),
+    date_precision: all.date_precision === "datetime_seconds"
+      ? "datetime_seconds"
+      : all.date_precision === "datetime" ? "datetime" : "date",
   });
+});
+
+app.get("/api/friends", async (c) => {
+  const db = c.get("db");
+  const links = await db.getApprovedFriendLinks();
+  if (links.length > 0) {
+    return c.json(links.map(publicFriendLink));
+  }
+
+  const settings = await db.getSettings();
+  const legacyLinks = parseSocialLinksSetting(settings.social_links || "");
+  return c.json(legacyLinks.map((link, index) => ({
+    id: -index - 1,
+    name: link.name,
+    url: link.url,
+    description: link.description || "",
+    avatarUrl: link.avatarUrl || "",
+    sortOrder: link.sortOrder ?? index,
+  })));
+});
+
+app.post("/api/friends/apply", async (c) => {
+  const ip = getClientIp(c);
+  if (isFriendLinkRateLimited(ip, Date.now())) {
+    return c.json({ error: "提交过于频繁，请稍后再试" }, 429);
+  }
+
+  const parsed = await readJson<Record<string, unknown>>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const name = normalizeText(body.name, 80);
+  const url = normalizePublicUrl(body.url);
+  const description = normalizeText(body.description, 240);
+  const avatarUrl = normalizePublicUrl(body.avatarUrl);
+  const ownerName = normalizeText(body.ownerName, 80);
+  const ownerEmail = normalizeOptionalEmail(body.ownerEmail);
+
+  if (!name || !url || !description) {
+    return c.json({ error: "请填写站点名称、有效 URL 和简介" }, 400);
+  }
+  if (body.ownerEmail && !ownerEmail) {
+    return c.json({ error: "联系邮箱格式无效" }, 400);
+  }
+
+  try {
+    const link = await c.get("db").createFriendLink({
+      name,
+      url,
+      description,
+      avatarUrl,
+      ownerName,
+      ownerEmail,
+      status: "pending",
+      source: "submission",
+    });
+    await triggerWebhook(c, "friend_link_submitted", { id: link.id, name, url });
+    notifyFriendSubmission(c, link);
+    return c.json({ success: true }, 201);
+  } catch (error) {
+    if (isUniqueConstraintError(error)) {
+      return c.json({ error: "该站点 URL 已提交或已存在" }, 409);
+    }
+    console.error("Failed to create friend link submission", error);
+    return c.json({ error: "友链申请暂时无法提交，请稍后再试" }, 500);
+  }
 });
 
 // 公开流量统计（侧边栏折线图）
@@ -534,7 +907,9 @@ app.get("/rss.xml", async (c) => {
   const settings = await db.getSettings();
   const siteTitle = settings.site_title || "Monolith";
   const siteDesc = settings.site_description || "";
-  const siteUrl = new URL(c.req.url).origin;
+  // Prefer public origin: /rss.xml is reverse-proxied via Pages Functions, so
+  // request origin may be *.workers.dev. Keep consistent with sitemap/robots.
+  const siteUrl = c.env.SITE_ORIGIN || new URL(c.req.url).origin;
 
   // 获取最新 20 篇文章
   const allPosts = await db.getRecentPublishedPosts(20);
@@ -605,10 +980,10 @@ app.get("/sitemap.xml", async (c) => {
   </url>`);
   }
 
-  // 独立页面
+  // 独立页面 — frontend route is /page/:slug (see client/src/app.tsx)
   for (const page of allPages) {
     urls.push(`  <url>
-    <loc>${escXml(siteUrl)}/pages/${escXml(page.slug)}</loc>
+    <loc>${escXml(siteUrl)}/page/${escXml(page.slug)}</loc>
     <changefreq>monthly</changefreq>
     <priority>0.5</priority>
   </url>`);
@@ -643,16 +1018,108 @@ Sitemap: ${siteUrl}/sitemap.xml
 const loginAttempts = new Map<string, { count: number; firstAttempt: number }>();
 const LOGIN_RATE_LIMIT = 5;       // 最多 5 次
 const LOGIN_RATE_WINDOW = 15 * 60 * 1000; // 15 分钟窗口
+const LOGIN_RATE_MAX_KEYS = 1000;
+const friendLinkAttempts = new Map<string, { count: number; firstAttempt: number }>();
+const FRIEND_LINK_RATE_LIMIT = 3;
+const FRIEND_LINK_RATE_WINDOW = 60 * 60 * 1000;
+const FRIEND_LINK_RATE_MAX_KEYS = 1000;
+const guestbookAttempts = new Map<string, { count: number; firstAttempt: number }>();
+const GUESTBOOK_RATE_LIMIT = 5;
+const GUESTBOOK_RATE_WINDOW = 60 * 60 * 1000;
+const GUESTBOOK_RATE_MAX_KEYS = 1000;
+
+function getClientIp(c: any): string {
+  const cfIp = c.req.header("CF-Connecting-IP")?.trim();
+  if (cfIp) return cfIp;
+  return c.req.header("X-Forwarded-For")?.split(",")[0]?.trim() || "unknown";
+}
+
+function pruneLoginAttempts(now: number) {
+  for (const [ip, record] of loginAttempts.entries()) {
+    if ((now - record.firstAttempt) >= LOGIN_RATE_WINDOW) loginAttempts.delete(ip);
+  }
+  while (loginAttempts.size > LOGIN_RATE_MAX_KEYS) {
+    const oldest = loginAttempts.keys().next().value;
+    if (!oldest) break;
+    loginAttempts.delete(oldest);
+  }
+}
+
+function pruneFriendLinkAttempts(now: number) {
+  for (const [ip, record] of friendLinkAttempts.entries()) {
+    if ((now - record.firstAttempt) >= FRIEND_LINK_RATE_WINDOW) friendLinkAttempts.delete(ip);
+  }
+  while (friendLinkAttempts.size > FRIEND_LINK_RATE_MAX_KEYS) {
+    const oldest = friendLinkAttempts.keys().next().value;
+    if (!oldest) break;
+    friendLinkAttempts.delete(oldest);
+  }
+}
+
+function isFriendLinkRateLimited(ip: string, now: number): boolean {
+  pruneFriendLinkAttempts(now);
+  const record = friendLinkAttempts.get(ip);
+  if (record && record.count >= FRIEND_LINK_RATE_LIMIT && (now - record.firstAttempt) < FRIEND_LINK_RATE_WINDOW) {
+    return true;
+  }
+  if (!record || (now - record.firstAttempt) >= FRIEND_LINK_RATE_WINDOW) {
+    friendLinkAttempts.set(ip, { count: 1, firstAttempt: now });
+  } else {
+    record.count++;
+  }
+  return false;
+}
+
+function pruneGuestbookAttempts(now: number) {
+  for (const [ip, record] of guestbookAttempts.entries()) {
+    if ((now - record.firstAttempt) >= GUESTBOOK_RATE_WINDOW) guestbookAttempts.delete(ip);
+  }
+  while (guestbookAttempts.size > GUESTBOOK_RATE_MAX_KEYS) {
+    const oldest = guestbookAttempts.keys().next().value;
+    if (!oldest) break;
+    guestbookAttempts.delete(oldest);
+  }
+}
+
+function isGuestbookRateLimited(ip: string, now: number): boolean {
+  pruneGuestbookAttempts(now);
+  const record = guestbookAttempts.get(ip);
+  if (record && record.count >= GUESTBOOK_RATE_LIMIT && (now - record.firstAttempt) < GUESTBOOK_RATE_WINDOW) {
+    return true;
+  }
+  if (!record || (now - record.firstAttempt) >= GUESTBOOK_RATE_WINDOW) {
+    guestbookAttempts.set(ip, { count: 1, firstAttempt: now });
+  } else {
+    record.count++;
+  }
+  return false;
+}
+
+function getMissingAuthSecrets(env: Partial<Bindings>) {
+  return [
+    ["ADMIN_PASSWORD", env.ADMIN_PASSWORD],
+    ["JWT_SECRET", env.JWT_SECRET],
+  ].filter(([, value]) => typeof value !== "string" || value.length === 0).map(([key]) => key);
+}
 
 /* ── 认证 API ──────────────────────────────── */
 
 // 登录
 app.post("/api/auth/login", async (c) => {
   c.header("Cache-Control", "no-store");
-  const ip = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For") || "unknown";
+  const missingSecrets = getMissingAuthSecrets(c.env);
+  if (missingSecrets.length > 0) {
+    return c.json({
+      error: "后台认证未完成配置，请在 Cloudflare Workers 中配置 ADMIN_PASSWORD 和 JWT_SECRET 后重新部署。",
+      missing: missingSecrets,
+    }, 503);
+  }
+
+  const ip = getClientIp(c);
 
   // 速率限制
   const now = Date.now();
+  pruneLoginAttempts(now);
   const record = loginAttempts.get(ip);
   if (record && record.count >= LOGIN_RATE_LIMIT && (now - record.firstAttempt) < LOGIN_RATE_WINDOW) {
     return c.json({ error: "尝试次数过多，请稍后再试" }, 429);
@@ -663,7 +1130,9 @@ app.post("/api/auth/login", async (c) => {
     record.count++;
   }
 
-  const body = await c.req.json<{ password: string }>();
+  const parsed = await readJson<{ password: string }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   if (!body.password || body.password !== c.env.ADMIN_PASSWORD) {
     return c.json({ error: "密码错误" }, 401);
   }
@@ -811,6 +1280,42 @@ app.delete("/api/admin/comments/:id", async (c) => {
   return c.json({ success: true });
 });
 
+// 获取所有留言（管理后台）
+app.get("/api/admin/guestbook", async (c) => {
+  const db = c.get("db");
+  const beforeId = Number.parseInt(c.req.query("before") || "", 10);
+  const pageSize = 50;
+  const messages = await db.getAllGuestbookMessages(
+    pageSize + 1,
+    Number.isInteger(beforeId) && beforeId > 0 ? beforeId : undefined,
+  );
+  const items = messages.slice(0, pageSize);
+  return c.json({
+    items,
+    nextCursor: messages.length > pageSize ? items.at(-1)?.id ?? null : null,
+  });
+});
+
+// 审核留言
+app.post("/api/admin/guestbook/:id/approve", async (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "无效 ID" }, 400);
+  const db = c.get("db");
+  const ok = await db.approveGuestbookMessage(id);
+  if (!ok) return c.json({ error: "留言不存在" }, 404);
+  return c.json({ success: true });
+});
+
+// 删除留言
+app.delete("/api/admin/guestbook/:id", async (c) => {
+  const id = parseInt(c.req.param("id"), 10);
+  if (isNaN(id)) return c.json({ error: "无效 ID" }, 400);
+  const db = c.get("db");
+  const ok = await db.deleteGuestbookMessage(id);
+  if (!ok) return c.json({ error: "留言不存在" }, 404);
+  return c.json({ success: true });
+});
+
 // 从 markdown 中提取首张图片 URL，作为封面缺省兜底
 function extractFirstImage(markdown: string): string {
   if (!markdown) return "";
@@ -825,7 +1330,9 @@ function extractFirstImage(markdown: string): string {
 
 // 创建文章
 app.post("/api/admin/posts", async (c) => {
-  const body = await c.req.json();
+  const parsed = await readJson<any>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const db = c.get("db");
   if (!body.coverImage) {
     body.coverImage = extractFirstImage(body.content || "");
@@ -838,7 +1345,9 @@ app.post("/api/admin/posts", async (c) => {
 // 更新文章（同时创建版本快照如果是自动保存外的核心提交，不过我们可以简化，在每次保存时如果内容变更较大则创建版本，或者直接在保存时暴露保存新版本的选项。这里我们在更新接口本身提供一个 saveVersion 参数，或者每次 updatePost 之后根据是否新建版本保存）
 app.put("/api/admin/posts/:slug", async (c) => {
   const slug = c.req.param("slug");
-  const body = await c.req.json();
+  const parsed = await readJson<any>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const db = c.get("db");
   // 若用户清空了封面但正文有图，自动回填首图
   if (body.content !== undefined && (body.coverImage === undefined || body.coverImage === "")) {
@@ -881,7 +1390,9 @@ app.post("/api/admin/posts/:slug/versions/:id/restore", async (c) => {
 
 // 批量操作文章：发布 / 撤回发布 / 删除
 app.post("/api/admin/posts/batch", async (c) => {
-  const { slugs, action } = await c.req.json<{ slugs: string[]; action: "publish" | "unpublish" | "delete" }>();
+  const parsed = await readJson<{ slugs: string[]; action: "publish" | "unpublish" | "delete" }>(c);
+  if (!parsed.ok) return parsed.response;
+  const { slugs, action } = parsed.body;
   if (!["publish", "unpublish", "delete"].includes(action)) {
     return c.json({ error: "非法的批处理操作" }, 400);
   }
@@ -932,8 +1443,7 @@ function isSafeImageUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
     if (parsed.protocol !== "https:") return false;
-    if (/^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|0\.|169\.254\.)/.test(parsed.hostname)) return false;
-    return true;
+    return !isBlockedWebdavHostname(parsed.hostname);
   } catch {
     return false;
   }
@@ -1145,9 +1655,103 @@ app.get("/api/admin/settings", async (c) => {
 
 app.put("/api/admin/settings", async (c) => {
   const db = c.get("db");
-  const body = await c.req.json<Record<string, string>>();
-  await db.saveSettings(body);
+  const parsed = await readJson<Record<string, string>>(c);
+  if (!parsed.ok) return parsed.response;
+  await db.saveSettings(normalizeSettings(parsed.body) || {});
   return c.json({ success: true });
+});
+
+app.get("/api/admin/friends", async (c) => {
+  const links = await c.get("db").getAllFriendLinks();
+  return c.json(links);
+});
+
+app.post("/api/admin/friends", async (c) => {
+  const parsed = await readJson<Record<string, unknown>>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const name = normalizeText(body.name, 80);
+  const url = normalizePublicUrl(body.url);
+  if (!name || !url) return c.json({ error: "请填写名称和有效 URL" }, 400);
+
+  try {
+    const link = await c.get("db").createFriendLink({
+      name,
+      url,
+      description: normalizeText(body.description, 240),
+      avatarUrl: normalizePublicUrl(body.avatarUrl),
+      ownerName: normalizeText(body.ownerName, 80),
+      ownerEmail: normalizeOptionalEmail(body.ownerEmail),
+      status: body.status === "pending" || body.status === "rejected" ? body.status : "approved",
+      source: "manual",
+      sortOrder: typeof body.sortOrder === "number" ? body.sortOrder : 0,
+    });
+    return c.json(link, 201);
+  } catch {
+    return c.json({ error: "该 URL 已存在" }, 409);
+  }
+});
+
+app.put("/api/admin/friends/:id", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效 ID" }, 400);
+  const parsed = await readJson<Record<string, unknown>>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const url = body.url === undefined ? undefined : normalizePublicUrl(body.url);
+  if (body.url !== undefined && !url) return c.json({ error: "URL 无效" }, 400);
+
+  const updated = await c.get("db").updateFriendLink(id, {
+    ...(body.name !== undefined && { name: normalizeText(body.name, 80) }),
+    ...(url !== undefined && { url }),
+    ...(body.description !== undefined && { description: normalizeText(body.description, 240) }),
+    ...(body.avatarUrl !== undefined && { avatarUrl: normalizePublicUrl(body.avatarUrl) }),
+    ...(body.ownerName !== undefined && { ownerName: normalizeText(body.ownerName, 80) }),
+    ...(body.ownerEmail !== undefined && { ownerEmail: normalizeOptionalEmail(body.ownerEmail) }),
+    ...(body.status === "pending" || body.status === "approved" || body.status === "rejected" ? { status: body.status } : {}),
+    ...(typeof body.sortOrder === "number" && { sortOrder: body.sortOrder }),
+  });
+  if (!updated) return c.json({ error: "友链不存在" }, 404);
+  return c.json(updated);
+});
+
+app.post("/api/admin/friends/:id/approve", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效 ID" }, 400);
+  const db = c.get("db");
+  const link = (await db.getAllFriendLinks()).find((item) => item.id === id);
+  if (!link) return c.json({ error: "友链不存在" }, 404);
+  const ok = await db.approveFriendLink(id);
+  if (!ok) return c.json({ error: "友链不存在" }, 404);
+  notifyFriendReview(c, link, true);
+  return c.json({ success: true });
+});
+
+app.post("/api/admin/friends/:id/reject", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效 ID" }, 400);
+  const db = c.get("db");
+  const link = (await db.getAllFriendLinks()).find((item) => item.id === id);
+  if (!link) return c.json({ error: "友链不存在" }, 404);
+  const ok = await db.rejectFriendLink(id);
+  if (!ok) return c.json({ error: "友链不存在" }, 404);
+  notifyFriendReview(c, link, false);
+  return c.json({ success: true });
+});
+
+app.delete("/api/admin/friends/:id", async (c) => {
+  const id = Number(c.req.param("id"));
+  if (!Number.isInteger(id)) return c.json({ error: "无效 ID" }, 400);
+  const ok = await c.get("db").deleteFriendLink(id);
+  if (!ok) return c.json({ error: "友链不存在" }, 404);
+  return c.json({ success: true });
+});
+
+app.post("/api/admin/friends/import-social-links", async (c) => {
+  const settings = await c.get("db").getSettings();
+  const links = parseSocialLinksSetting(settings.social_links || "");
+  const imported = await c.get("db").importFriendLinks(links);
+  return c.json({ imported });
 });
 
 /* ── 数据备份 ──────────────────────────────── */
@@ -1195,7 +1799,9 @@ app.get("/api/admin/backup/r2-list", async (c) => {
 
 // 删除备份
 app.post("/api/admin/backup/r2-delete", async (c) => {
-  const { name } = await c.req.json<{ name: string }>();
+  const parsed = await readJson<{ name: string }>(c);
+  if (!parsed.ok) return parsed.response;
+  const { name } = parsed.body;
   if (!name) return c.json({ error: "缺少文件名" }, 400);
 
   const storage = c.get("storage");
@@ -1206,7 +1812,9 @@ app.post("/api/admin/backup/r2-delete", async (c) => {
 
 // 预览备份内容摘要
 app.post("/api/admin/backup/r2-preview", async (c) => {
-  const { name, mode, includeSettings } = await c.req.json<{ name: string; mode?: "merge" | "overwrite"; includeSettings?: boolean }>();
+  const parsed = await readJson<{ name: string; mode?: "merge" | "overwrite"; includeSettings?: boolean }>(c);
+  if (!parsed.ok) return parsed.response;
+  const { name, mode, includeSettings } = parsed.body;
   const storage = c.get("storage");
   const object = await storage.get(`backups/${name}`);
 
@@ -1225,7 +1833,9 @@ app.post("/api/admin/backup/r2-preview", async (c) => {
 
 // 预检本地备份或多平台迁移数据
 app.post("/api/admin/backup/preview", async (c) => {
-  const body = await c.req.json<BackupPreviewPayload & BackupPreviewOptions>();
+  const parsed = await readJson<BackupPreviewPayload & BackupPreviewOptions>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const db = c.get("db");
   return c.json(await buildBackupPreview(db, body, {
     mode: body.mode,
@@ -1236,7 +1846,9 @@ app.post("/api/admin/backup/preview", async (c) => {
 
 // 从 JSON 文件恢复/导入数据
 app.post("/api/admin/backup/restore", async (c) => {
-  const body = await c.req.json();
+  const parsed = await readJson<any>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const db = c.get("db");
   const includeSettings = body.includeSettings ?? Boolean(body.settings);
 
@@ -1244,7 +1856,7 @@ app.post("/api/admin/backup/restore", async (c) => {
     const imported = await db.importAll({
       posts: body.posts,
       tags: body.tags,
-      settings: includeSettings ? body.settings : undefined,
+      settings: includeSettings ? normalizeSettings(body.settings) : undefined,
       mode: body.mode || "merge",
     });
     return c.json({ success: true, imported, mode: body.mode || "merge" });
@@ -1255,7 +1867,9 @@ app.post("/api/admin/backup/restore", async (c) => {
 
 // 从 R2 备份文件直接恢复数据（真正的恢复逻辑）
 app.post("/api/admin/backup/r2-restore", async (c) => {
-  const { name, mode, includeSettings } = await c.req.json<{ name: string; mode?: "merge" | "overwrite"; includeSettings?: boolean }>();
+  const parsed = await readJson<{ name: string; mode?: "merge" | "overwrite"; includeSettings?: boolean }>(c);
+  if (!parsed.ok) return parsed.response;
+  const { name, mode, includeSettings } = parsed.body;
   if (!name) return c.json({ error: "缺少备份文件名" }, 400);
 
   const storage = c.get("storage");
@@ -1281,7 +1895,7 @@ app.post("/api/admin/backup/r2-restore", async (c) => {
     const imported = await db.importAll({
       posts: data.posts as Parameters<typeof db.importAll>[0]["posts"],
       tags: data.tags as Parameters<typeof db.importAll>[0]["tags"],
-      settings: (includeSettings ?? true) ? data.settings : undefined,
+      settings: (includeSettings ?? true) ? normalizeSettings(data.settings) : undefined,
       mode: mode || "merge",
     });
     return c.json({ success: true, imported, source: name, mode: mode || "merge" });
@@ -1294,9 +1908,11 @@ app.post("/api/admin/backup/r2-restore", async (c) => {
 
 // WebDAV 备份
 app.post("/api/admin/backup/webdav", async (c) => {
-  const body = await c.req.json<{
+  const parsed = await readJson<{
     url: string; username: string; password: string; path?: string;
-  }>();
+  }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
 
   // SSRF 防护：仅允许 https:// 的外部 URL
   const target = validateWebdavTarget(body.url);
@@ -1311,12 +1927,12 @@ app.post("/api/admin/backup/webdav", async (c) => {
   const fullUrl = `${target.baseUrl}${remotePath}/${filename}`;
 
   try {
-    await fetch(`${target.baseUrl}${remotePath}/`, {
+    await fetchWebdav(`${target.baseUrl}${remotePath}/`, {
       method: "MKCOL",
       headers: { Authorization: "Basic " + btoa(`${body.username}:${body.password}`) },
-    }).catch(() => {});
+    });
 
-    const res = await fetch(fullUrl, {
+    const res = await fetchWebdav(fullUrl, {
       method: "PUT",
       headers: {
         Authorization: "Basic " + btoa(`${body.username}:${body.password}`),
@@ -1336,9 +1952,11 @@ app.post("/api/admin/backup/webdav", async (c) => {
 });
 
 app.post("/api/admin/backup/webdav-test", async (c) => {
-  const body = await c.req.json<{
+  const parsed = await readJson<{
     url: string; username: string; password: string; path?: string;
-  }>();
+  }>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   if (!body.url || !body.username || !body.password) {
     return c.json({ error: "请完整填写 WebDAV 地址、用户名和密码" }, 400);
   }
@@ -1351,8 +1969,8 @@ app.post("/api/admin/backup/webdav-test", async (c) => {
   const testUrl = `${target.baseUrl}${remotePath}/.monolith-webdav-test.txt`;
 
   try {
-    await fetch(directoryUrl, { method: "MKCOL", headers: { Authorization: auth } }).catch(() => {});
-    const res = await fetch(testUrl, {
+    await fetchWebdav(directoryUrl, { method: "MKCOL", headers: { Authorization: auth } });
+    const res = await fetchWebdav(testUrl, {
       method: "PUT",
       headers: { Authorization: auth, "Content-Type": "text/plain" },
       body: `monolith webdav test ${new Date().toISOString()}`,
@@ -1360,7 +1978,7 @@ app.post("/api/admin/backup/webdav-test", async (c) => {
     if (!res.ok && res.status !== 201 && res.status !== 204) {
       return c.json({ error: `WebDAV 写入测试失败: ${res.status} ${res.statusText}` }, 500);
     }
-    await fetch(testUrl, { method: "DELETE", headers: { Authorization: auth } }).catch(() => {});
+    await fetchWebdav(testUrl, { method: "DELETE", headers: { Authorization: auth } });
     return c.json({ success: true, path: remotePath || "/" });
   } catch (err) {
     return c.json({ error: `WebDAV 测试失败: ${err instanceof Error ? err.message : "未知错误"}` }, 500);
@@ -1462,7 +2080,9 @@ function convertHaloData(haloData: any): {
 // 预览 Halo 导入数据（不写入）
 app.post("/api/admin/import/halo/preview", async (c) => {
   try {
-    const haloData = await c.req.json();
+    const parsed = await readJson<any>(c);
+    if (!parsed.ok) return parsed.response;
+    const haloData = parsed.body;
     const result = convertHaloData(haloData);
     return c.json({
       success: true,
@@ -1478,7 +2098,9 @@ app.post("/api/admin/import/halo/preview", async (c) => {
 // 正式导入 Halo 数据
 app.post("/api/admin/import/halo", async (c) => {
   try {
-    const body = await c.req.json();
+    const parsed = await readJson<any>(c);
+    if (!parsed.ok) return parsed.response;
+    const body = parsed.body;
     const haloData = body.data || body;
     const mode = body.mode || "merge";
     const db = c.get("db");
@@ -1534,7 +2156,9 @@ app.get("/api/admin/pages/:slug", async (c) => {
 
 // 管理：创建或更新独立页
 app.post("/api/admin/pages", async (c) => {
-  const body = await c.req.json();
+  const parsed = await readJson<any>(c);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
   const db = c.get("db");
   const result = await db.upsertPage(body);
   return c.json({ success: true, slug: body.slug, action: result.action });
@@ -1542,7 +2166,9 @@ app.post("/api/admin/pages", async (c) => {
 
 // 管理：删除独立页
 app.post("/api/admin/pages/delete", async (c) => {
-  const { slug } = await c.req.json<{ slug: string }>();
+  const parsed = await readJson<{ slug: string }>(c);
+  if (!parsed.ok) return parsed.response;
+  const { slug } = parsed.body;
   const db = c.get("db");
   await db.deletePage(slug);
   return c.json({ success: true });

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, type ReactNode } from "react";
 import { getToken } from "@/lib/api";
-import { Save, Globe, User, Link2, ToggleLeft, ToggleRight, Code, Rss, Plus, Trash2, GripVertical, Home, Eye, Search, CheckCircle2, AlertTriangle } from "lucide-react";
+import { Save, Globe, User, Link2, ToggleLeft, ToggleRight, Code, Rss, Plus, Trash2, GripVertical, Home, Eye, Search, CheckCircle2, AlertTriangle, Clock3 } from "lucide-react";
 
 type Settings = {
   site_title: string;
@@ -11,6 +11,7 @@ type Settings = {
   hero_description: string;
   hero_actions: string;
   hero_topics: string;
+  site_icon: string;
   site_og_image: string;
   author_name: string;
   author_title: string;
@@ -24,6 +25,8 @@ type Settings = {
   rss_enabled: string;
   custom_header: string;
   custom_footer: string;
+  site_timezone: string;
+  date_precision: string;
 };
 
 const defaultSettings: Settings = {
@@ -43,6 +46,7 @@ const defaultSettings: Settings = {
     { title: "阅读体验", desc: "让长文、代码与目录保持同一节奏" },
     { title: "边缘部署", desc: "Workers / D1 / R2 的真实工程路径" },
   ]),
+  site_icon: "",
   site_og_image: "",
   author_name: "Monolith",
   author_title: "独立开发者",
@@ -56,6 +60,8 @@ const defaultSettings: Settings = {
   rss_enabled: "true",
   custom_header: "",
   custom_footer: "",
+  site_timezone: "Asia/Shanghai",
+  date_precision: "date",
 };
 
 type TabId = "identity" | "home" | "profile" | "social" | "advanced";
@@ -443,8 +449,32 @@ export function AdminSettings() {
                   <SettingField label="站点标题" value={settings.site_title} onChange={(v) => updateSetting("site_title", v)} placeholder="Monolith" hint="用于首页 H1、SEO site_name 和 RSS 标题。" />
                   <SettingField label="站点描述" value={settings.site_description} onChange={(v) => updateSetting("site_description", v)} placeholder="一句话描述你的博客（建议 80-160 字）" multiline hint={`${settings.site_description.length} 个字符，首页 Hero 未单独设置时也会使用它。`} />
                   <SettingField label="首页标语" value={settings.site_tagline} onChange={(v) => updateSetting("site_tagline", v)} placeholder="显示在首页首屏小标题区域" hint="作为首页副标题的回退值，适合写短句而不是长段落。" />
+                  <SettingField label="站点图标 URL" value={settings.site_icon} onChange={(v) => updateSetting("site_icon", v)} placeholder="https://example.com/favicon.png" mono hint="用于浏览器 favicon 和左上角后台暗门入口，留空则使用默认图标。" />
                   <SettingField label="社交分享图 URL" value={settings.site_og_image} onChange={(v) => updateSetting("site_og_image", v)} placeholder="https://example.com/og-image.png" mono hint="用于首页 Open Graph / Twitter Card，留空则使用默认 og-default.png。" />
                   <SettingField label="页脚文本" value={settings.footer_text} onChange={(v) => updateSetting("footer_text", v)} placeholder="© 2026 ..." hint="显示在全站页脚，支持纯文本。" />
+                  <div className="grid gap-[12px] sm:grid-cols-2">
+                    <label className="block">
+                      <span className="mb-[6px] flex items-center gap-[6px] text-[11px] font-medium text-muted-foreground/50"><Clock3 className="h-[12px] w-[12px]" />站点时区</span>
+                      <select value={settings.site_timezone} onChange={(e) => updateSetting("site_timezone", e.target.value)} className="settings-input h-[40px] w-full">
+                        <option value="Asia/Shanghai">Asia/Shanghai（中国标准时间）</option>
+                        <option value="UTC">UTC（协调世界时）</option>
+                        <option value="Asia/Tokyo">Asia/Tokyo（日本标准时间）</option>
+                        <option value="America/Los_Angeles">America/Los_Angeles（太平洋时间）</option>
+                        <option value="America/New_York">America/New_York（东部时间）</option>
+                        <option value="Europe/London">Europe/London（英国时间）</option>
+                      </select>
+                      <span className="mt-[6px] block text-[11px] leading-[1.5] text-muted-foreground/40">公开文章、评论和留言时间统一使用此 IANA 时区。</span>
+                    </label>
+                    <label className="block">
+                      <span className="mb-[6px] flex items-center gap-[6px] text-[11px] font-medium text-muted-foreground/50">日期显示精度</span>
+                      <select value={settings.date_precision} onChange={(e) => updateSetting("date_precision", e.target.value)} className="settings-input h-[40px] w-full">
+                        <option value="date">仅日期</option>
+                        <option value="datetime">日期 + 时分</option>
+                        <option value="datetime_seconds">日期 + 时分秒</option>
+                      </select>
+                      <span className="mt-[6px] block text-[11px] leading-[1.5] text-muted-foreground/40">默认仅显示日期，适合保持当前首页与归档的密度。</span>
+                    </label>
+                  </div>
                 </div>
               </div>
 
