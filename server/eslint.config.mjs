@@ -2,7 +2,6 @@ import security from "eslint-plugin-security";
 import tseslint from "@typescript-eslint/eslint-plugin";
 import tsparser from "@typescript-eslint/parser";
 export default [
-  { ignores: ["dist/**", "node_modules/**", ".wrangler/**", "*.config.*"] },
   {
     files: ["**/*.ts"],
     plugins: { security, "@typescript-eslint": tseslint },
