@@ -23,18 +23,6 @@ const DEFAULT_HERO_TOPICS: HeroTopic[] = [
   { title: "边缘部署", desc: "Workers / D1 / R2 的真实工程路径" },
 ];
 
-const DEFAULT_HERO_ACTIONS: HeroAction[] = [
-  { label: "最新文章", href: "#latest-posts" },
-  { label: "主题索引", href: "#content-index" },
-  { label: "工程笔记", href: "/archive" },
-];
-
-const DEFAULT_HERO_TOPICS: HeroTopic[] = [
-  { title: "系统设计", desc: "从边界、接口和运维成本切入" },
-  { title: "阅读体验", desc: "让长文、代码与目录保持同一节奏" },
-  { title: "边缘部署", desc: "Workers / D1 / R2 的真实工程路径" },
-];
-
 type TrafficData = {
   totalViews: number;
   totalPosts: number;
